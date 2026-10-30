@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sets up the passphrase-protected Claude launcher.
-# Usage: ./setup-claude-lock.sh [install|update|uninstall [-y]]
+# Usage: ./setup-claude-lock.sh [install|update|lock-login|uninstall [-y]]
 set -euo pipefail
 umask 077
 
@@ -8,6 +8,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KEYFILE="${CLAUDE_SECURE_KEYFILE:-$HOME/.claude/secure/api-key.gpg}"
 SECDIR="$(dirname "$KEYFILE")"
 BIN="${PREFIX:-$HOME/.local}/bin"
+CREDENTIALS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
 
 die() {
   echo "setup-claude-lock: $*" >&2
@@ -15,19 +16,30 @@ die() {
 }
 
 usage() {
-  echo "Usage: $0 [install|update|uninstall [-y]]" >&2
+  echo "Usage: $0 [install|update|lock-login|uninstall [-y]]" >&2
   exit 2
 }
 
-# Prompts for the key and writes it atomically, GPG-encrypted, to $KEYFILE.
+confirm() {
+  local answer
+  read -rp "$1 [y/N] " answer
+  case "$answer" in
+    y | Y) ;;
+    *) die "aborted." ;;
+  esac
+}
+
+# Prompts for the secret and writes it atomically, GPG-encrypted, to $KEYFILE.
 store_key() {
   local key tmp
-  read -rsp "Anthropic API key: " key
+  echo "Enter an API key, or a subscription OAuth token from \`claude setup-token\`."
+  read -rsp "Secret: " key
   echo
-  [ -n "$key" ] || die "empty key."
+  [ -n "$key" ] || die "empty secret."
   case "$key" in
-    sk-ant-*) ;;
-    *) echo "Warning: key does not start with sk-ant-." >&2 ;;
+    sk-ant-oat*) echo "Detected: OAuth token (subscription billing)." ;;
+    sk-ant-*) echo "Detected: API key (API billing)." ;;
+    *) echo "Warning: secret does not start with sk-ant-." >&2 ;;
   esac
 
   install -d -m 700 "$SECDIR"
@@ -56,6 +68,31 @@ install_bin() {
   esac
 }
 
+# Removes the stored subscription login so plain `claude` no longer starts
+# without a passphrase. MCP server tokens in the same file are kept.
+lock_login() {
+  command -v jq >/dev/null || die "jq is missing (sudo apt install jq)."
+  [ -f "$CREDENTIALS" ] || die "$CREDENTIALS not found; nothing to lock."
+  jq -e 'has("claudeAiOauth")' "$CREDENTIALS" >/dev/null 2>&1 ||
+    die "no stored login (claudeAiOauth) in $CREDENTIALS; nothing to lock."
+  [ -f "$KEYFILE" ] ||
+    die "no encrypted secret yet. Run '$0 install' first, or you will lose access."
+
+  echo "This removes the stored login from $CREDENTIALS (MCP tokens are kept)."
+  echo "A backup is written to $CREDENTIALS.bak; delete it afterwards, it contains the login."
+  confirm "Continue?"
+
+  local tmp
+  tmp="$(mktemp "$CREDENTIALS.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  cp -p "$CREDENTIALS" "$CREDENTIALS.bak"
+  jq 'del(.claudeAiOauth)' "$CREDENTIALS" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$CREDENTIALS"
+  trap - EXIT
+  echo "Done. Plain \`claude\` now asks for a login; use claude-secure instead."
+}
+
 command -v gpg >/dev/null || die "gpg is missing (sudo apt install gnupg)."
 
 case "${1:-install}" in
@@ -68,13 +105,12 @@ case "${1:-install}" in
     store_key
     install_bin
     ;;
+  lock-login)
+    lock_login
+    ;;
   uninstall)
     if [ "${2:-}" != "-y" ]; then
-      read -rp "Remove the encrypted key and claude-secure? [y/N] " answer
-      case "$answer" in
-        y | Y) ;;
-        *) die "aborted." ;;
-      esac
+      confirm "Remove the encrypted secret and claude-secure?"
     fi
     rm -f "$KEYFILE" "$BIN/claude-secure"
     rmdir "$SECDIR" 2>/dev/null || true
