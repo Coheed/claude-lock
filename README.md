@@ -11,7 +11,7 @@ Start Claude Code from the CLI only after entering a passphrase. Works with an A
 ## Requirements
 
 - `gpg` (on WSL usually `sudo apt install gnupg pinentry-curses`)
-- `jq` (only for `lock-login`)
+- `jq` (only for `lock-login`, `restore-login` and the login check)
 - `~/.local/bin` in your `PATH`
 - a terminal (the passphrase is requested interactively)
 
@@ -24,12 +24,18 @@ git clone https://github.com/Coheed/claude-lock.git && cd claude-lock
 
 Afterwards, start `claude-secure` instead of `claude`.
 
-| Command                            | Effect                                                                   |
-| ---------------------------------- | ------------------------------------------------------------------------ |
-| `./setup-claude-lock.sh install`   | Ask for the secret, encrypt it, install `claude-secure`                  |
-| `./setup-claude-lock.sh update`    | Replace the secret or passphrase                                         |
-| `./setup-claude-lock.sh lock-login`| Remove the stored subscription login so plain `claude` is locked out     |
-| `./setup-claude-lock.sh uninstall` | Remove the secret and `claude-secure` (`-y` skips the prompt)            |
+| Command                               | Effect                                                                         |
+| ------------------------------------- | ------------------------------------------------------------------------------ |
+| `./setup-claude-lock.sh install`      | Ask for the secret, encrypt it, install `claude-secure`                        |
+| `./setup-claude-lock.sh update`       | Replace the secret or passphrase                                               |
+| `./setup-claude-lock.sh reinstall`    | Reinstall `claude-secure` only, e.g. after `git pull`                          |
+| `./setup-claude-lock.sh status`       | Show the secret, the installed launcher and whether plain `claude` is locked   |
+| `./setup-claude-lock.sh lock-login`   | Remove the stored subscription login so plain `claude` is locked out           |
+| `./setup-claude-lock.sh restore-login`| Put the login from the encrypted backup back                                   |
+| `./setup-claude-lock.sh uninstall`    | Remove the secret and `claude-secure` (`-y` skips the prompt)                  |
+| `./setup-claude-lock.sh help`         | Show all commands                                                              |
+
+Spaces and tabs in the pasted secret are removed. The secret is encrypted with AES256 and the strongest GnuPG key derivation settings, so every passphrase guess is expensive.
 
 ## Subscription / Google login
 
@@ -37,7 +43,7 @@ An API key bills the API. To use your subscription instead (for example a claude
 
 1. Run `claude setup-token` and complete the browser login. It prints a long-lived OAuth token (valid for one year) and does not store it.
 2. Run `./setup-claude-lock.sh install` and paste that token as the secret.
-3. Run `./setup-claude-lock.sh lock-login`. This deletes the stored login (`claudeAiOauth`) from `~/.claude/.credentials.json` after writing a backup (`.credentials.json.bak`, delete it afterwards). Tokens of MCP servers in the same file are kept.
+3. Run `./setup-claude-lock.sh lock-login`. This deletes the stored login (`claudeAiOauth`) from `~/.claude/.credentials.json`. Beforehand the file is backed up GPG-encrypted to `.credentials.json.bak.gpg` (you choose a passphrase). Tokens of MCP servers in the same file are kept. `restore-login` puts the login back and keeps MCP tokens added in the meantime.
 4. Start `claude-secure`.
 
 The token only allows model requests: no Remote Control, no claude.ai connectors, and `/usage` may not work. Locally configured MCP servers keep working. After a year, create a new token and run `update`.
@@ -60,10 +66,12 @@ Environment variables:
 ## Development
 
 ```bash
-shellcheck claude-secure setup-claude-lock.sh
+shellcheck claude-secure setup-claude-lock.sh test/helpers.bash test/*.bats
+shfmt -d -i 2 -ci claude-secure setup-claude-lock.sh test/helpers.bash
+bats test/
 ```
 
-This also runs in CI (`.github/workflows/ci.yml`).
+The tests run in a temporary `HOME` and `GNUPGHOME` with stubs for `gpg` (passphrase without a prompt), `tty` and `claude`, so they never touch your real setup. Requirements: `bats`, `gnupg`, `jq`. All three checks also run in CI (`.github/workflows/ci.yml`).
 
 ## License
 

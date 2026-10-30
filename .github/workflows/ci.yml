@@ -8,9 +8,22 @@ permissions:
   contents: read
 
 jobs:
-  shellcheck:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install shfmt
+        run: sudo apt-get update && sudo apt-get install -y shfmt
       - name: ShellCheck
-        run: shellcheck claude-secure setup-claude-lock.sh
+        run: shellcheck claude-secure setup-claude-lock.sh test/helpers.bash test/*.bats
+      - name: shfmt
+        run: shfmt -d -i 2 -ci claude-secure setup-claude-lock.sh test/helpers.bash
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y bats gnupg jq
+      - name: bats
+        run: bats test/

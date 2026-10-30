@@ -39,10 +39,8 @@ main() {
   command -v claude >/dev/null || die "claude not found in PATH."
   [ -f "$KEYFILE" ] || die "encrypted secret not found: $KEYFILE (run setup-claude-lock.sh install first)."
 
-  local mode
-  mode="$(stat -c %a "$KEYFILE")"
-  if [ "${mode: -2}" != "00" ]; then
-    echo "claude-secure: warning: $KEYFILE is accessible by others (mode $mode)." >&2
+  if [ -n "$(find "$KEYFILE" -perm /077)" ]; then
+    echo "claude-secure: warning: $KEYFILE is accessible by others (mode $(stat -c %a "$KEYFILE"))." >&2
   fi
 
   if command -v jq >/dev/null && [ -f "$CREDENTIALS" ] &&
@@ -69,7 +67,8 @@ main() {
     *) export CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR=3 ;;
   esac
 
-  exec claude "$@" 3<<<"$secret"
+  # Unlike a here-string: no trailing newline, never a temp file on disk.
+  exec claude "$@" 3< <(printf '%s' "$secret")
 }
 
 main "$@"
