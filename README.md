@@ -2,6 +2,8 @@
 
 Start Claude Code from the CLI only after entering a passphrase. Works with an API key or with a subscription login (claude.ai account, including Google sign-in).
 
+There are two variants: Bash (Linux, macOS, WSL, uses GnuPG) and PowerShell (native Windows, no dependencies, see [Windows](#windows)).
+
 ## How it works
 
 - Your secret is stored encrypted with `gpg --symmetric` (AES256) at `~/.claude/secure/api-key.gpg`. It is either an API key or a subscription OAuth token from `claude setup-token`; the type is detected automatically.
@@ -48,13 +50,32 @@ An API key bills the API. To use your subscription instead (for example a claude
 
 The token only allows model requests: no Remote Control, no claude.ai connectors, and `/usage` may not work. Locally configured MCP servers keep working. After a year, create a new token and run `update`.
 
+## Windows
+
+The PowerShell variant in `windows/` needs nothing but the Windows PowerShell 5.1 and .NET Framework 4.7.2 that ship with Windows 10 (1803+) and Windows 11. No GnuPG, no WSL.
+
+Download `claude-lock-windows-vX.Y.Z.zip` and `SHA256SUMS` from the [releases](../../releases), check the hash (`Get-FileHash claude-lock-windows-*.zip`), unzip and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup-claude-lock.ps1 install
+```
+
+Afterwards start `claude-secure` instead of `claude`. The commands are the same as in the table above (`status`, `update`, `reinstall`, `lock-login`, `restore-login`, `uninstall`), the files go to `%USERPROFILE%\.local\bin`.
+
+Differences to the Bash variant:
+
+- The secret is stored in `%USERPROFILE%\.claude\secure\api-key.enc` with PBKDF2-HMAC-SHA512 (600,000 iterations), AES-256-CBC and an HMAC-SHA256 (encrypt-then-MAC), all from .NET. The file format is not compatible with the `.gpg` file of the Bash variant. The file is restricted to your user through its ACL.
+- Windows cannot pass file descriptors, so the secret reaches `claude` as an environment variable of that child process only. It is never set in your shell and never written to disk, but any process of your user can read it from the running `claude`. This is weaker than the file descriptor of the Bash variant.
+- The `claude-secure.cmd` shim starts the launcher with `-ExecutionPolicy Bypass`, so the execution policy does not get in the way.
+
 ## Configuration
 
 Environment variables:
 
 - `CLAUDE_SECURE_KEYFILE`: path to the encrypted secret (default `~/.claude/secure/api-key.gpg`)
 - `CLAUDE_CONFIG_DIR`: Claude Code config directory, used to find `.credentials.json` (default `~/.claude`)
-- `PREFIX`: installation prefix (default `~/.local`)
+- `PREFIX`: installation prefix (default `~/.local`), Bash variant only
+- `CLAUDE_LOCK_BIN`: installation directory of the Windows variant (default `%USERPROFILE%\.local\bin`)
 
 ## Limitations
 
@@ -72,6 +93,14 @@ bats test/
 ```
 
 The tests run in a temporary `HOME` and `GNUPGHOME` with stubs for `gpg` (passphrase without a prompt), `tty` and `claude`, so they never touch your real setup. Requirements: `bats`, `gnupg`, `jq`. All three checks also run in CI (`.github/workflows/ci.yml`).
+
+The Windows variant has its own dependency-free test runner for Windows PowerShell 5.1. It only touches a temporary directory and aborts if a path points anywhere else:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File windows\test\Run-Tests.ps1
+```
+
+Some antivirus products (for example Bitdefender) flag this script as a heuristic false positive and block it. CI runs it on `windows-latest`; pushing a tag `vX.Y.Z` runs the tests again and publishes the release archive.
 
 ## License
 

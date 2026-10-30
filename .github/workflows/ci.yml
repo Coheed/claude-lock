@@ -27,3 +27,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y bats gnupg jq
       - name: bats
         run: bats test/
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `shell: powershell` is Windows PowerShell 5.1, the version the scripts target.
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          Invoke-ScriptAnalyzer -Path windows -Recurse -Severity Error -EnableExit
+      - name: Tests
+        shell: powershell
+        run: .\windows\test\Run-Tests.ps1
