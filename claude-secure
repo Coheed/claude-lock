@@ -13,6 +13,15 @@ die() {
   exit 1
 }
 
+warn() {
+  echo "claude-secure: warning: $*" >&2
+}
+
+# Prints the permission bits of a file in octal (GNU and BSD/macOS stat).
+file_mode() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
 usage() {
   cat <<EOF
 Usage: claude-secure [claude arguments...]
@@ -39,13 +48,16 @@ main() {
   command -v claude >/dev/null || die "claude not found in PATH."
   [ -f "$KEYFILE" ] || die "encrypted secret not found: $KEYFILE (run setup-claude-lock.sh install first)."
 
-  if [ -n "$(find "$KEYFILE" -perm /077)" ]; then
-    echo "claude-secure: warning: $KEYFILE is accessible by others (mode $(stat -c %a "$KEYFILE"))." >&2
+  local mode
+  mode="$(file_mode "$KEYFILE")"
+  if ((8#$mode & 8#077)); then
+    warn "$KEYFILE is accessible by others (mode $mode)."
   fi
+  [ -O "$KEYFILE" ] || warn "$KEYFILE is not owned by you."
 
   if command -v jq >/dev/null && [ -f "$CREDENTIALS" ] &&
     jq -e 'has("claudeAiOauth")' "$CREDENTIALS" >/dev/null 2>&1; then
-    echo "claude-secure: warning: a stored login exists in $CREDENTIALS;" >&2
+    warn "a stored login exists in $CREDENTIALS;"
     echo "  plain \`claude\` can still start without a passphrase (see: setup-claude-lock.sh lock-login)." >&2
   fi
 

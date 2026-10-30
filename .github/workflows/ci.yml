@@ -11,7 +11,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install shfmt
         run: sudo apt-get update && sudo apt-get install -y shfmt
       - name: ShellCheck
@@ -22,7 +24,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y bats gnupg jq
       - name: bats
@@ -31,13 +35,20 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       # `shell: powershell` is Windows PowerShell 5.1, the version the scripts target.
       - name: PSScriptAnalyzer
         shell: powershell
         run: |
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
           Invoke-ScriptAnalyzer -Path windows -Recurse -Severity Error -EnableExit
+      - name: No batch files
+        shell: powershell
+        run: |
+          $batch = @(Get-ChildItem -Recurse -Include *.cmd, *.bat)
+          if ($batch) { $batch.FullName; exit 1 }
       - name: Tests
         shell: powershell
         run: .\windows\test\Run-Tests.ps1

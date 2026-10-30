@@ -5,6 +5,7 @@
 
 $script:FileMagic = [byte[]](0x43, 0x4C, 0x4B, 0x31) # "CLK1"
 $script:KdfIterations = 600000
+$script:MinKdfIterations = 100000
 $script:MaxKdfIterations = 20000000
 $script:SaltLength = 16
 $script:IvLength = 16
@@ -70,6 +71,11 @@ function Get-Slice([byte[]]$Bytes, [int]$Offset, [int]$Count) {
   , $slice
 }
 
+# Overwrites key material and passphrases once they are no longer needed.
+function Clear-Bytes([byte[]]$Bytes) {
+  if ($Bytes) { [Array]::Clear($Bytes, 0, $Bytes.Length) }
+}
+
 function Test-BytesEqual([byte[]]$A, [byte[]]$B) {
   if ($A.Length -ne $B.Length) { return $false }
   $diff = 0
@@ -82,7 +88,12 @@ function Get-LockKeys([byte[]]$Pass, [byte[]]$Salt, [int]$Iterations) {
   $kdf = [System.Security.Cryptography.Rfc2898DeriveBytes]::new(
     $Pass, $Salt, $Iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA512)
   try { $material = $kdf.GetBytes(64) } finally { $kdf.Dispose() }
-  @{ Enc = (Get-Slice $material 0 32); Mac = (Get-Slice $material 32 32) }
+  try { @{ Enc = (Get-Slice $material 0 32); Mac = (Get-Slice $material 32 32) } }
+  finally { Clear-Bytes $material }
+}
+
+function Clear-LockKeys($Keys) {
+  if ($Keys) { Clear-Bytes $Keys.Enc; Clear-Bytes $Keys.Mac }
 }
 
 function New-LockAes([byte[]]$Key, [byte[]]$Iv) {
@@ -101,23 +112,23 @@ function Protect-Secret([string]$Plain, [byte[]]$Pass) {
   $iv = New-RandomBytes $script:IvLength
   $iter = $script:KdfIterations
   $keys = Get-LockKeys $Pass $salt $iter
-
-  $aes = New-LockAes $keys.Enc $iv
   try {
+    $aes = New-LockAes $keys.Enc $iv
     $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($Plain)
-    $cipher = $aes.CreateEncryptor().TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
+    try { $cipher = $aes.CreateEncryptor().TransformFinalBlock($plainBytes, 0, $plainBytes.Length) }
+    finally { $aes.Dispose(); Clear-Bytes $plainBytes }
+
+    $iterBytes = [byte[]]@((($iter -shr 24) -band 255), (($iter -shr 16) -band 255), (($iter -shr 8) -band 255), ($iter -band 255))
+    $ms = New-Object System.IO.MemoryStream
+    foreach ($part in $script:FileMagic, $iterBytes, $salt, $iv, $cipher) { $ms.Write($part, 0, $part.Length) }
+    $body = $ms.ToArray()
+
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($keys.Mac)
+    try { $mac = $hmac.ComputeHash($body) } finally { $hmac.Dispose() }
+    $ms.Write($mac, 0, $mac.Length)
+    , $ms.ToArray()
   }
-  finally { $aes.Dispose() }
-
-  $iterBytes = [byte[]]@((($iter -shr 24) -band 255), (($iter -shr 16) -band 255), (($iter -shr 8) -band 255), ($iter -band 255))
-  $ms = New-Object System.IO.MemoryStream
-  foreach ($part in $script:FileMagic, $iterBytes, $salt, $iv, $cipher) { $ms.Write($part, 0, $part.Length) }
-  $body = $ms.ToArray()
-
-  $hmac = [System.Security.Cryptography.HMACSHA256]::new($keys.Mac)
-  try { $mac = $hmac.ComputeHash($body) } finally { $hmac.Dispose() }
-  $ms.Write($mac, 0, $mac.Length)
-  , $ms.ToArray()
+  finally { Clear-LockKeys $keys }
 }
 
 function Unprotect-Secret([byte[]]$Blob, [byte[]]$Pass) {
@@ -125,43 +136,67 @@ function Unprotect-Secret([byte[]]$Blob, [byte[]]$Pass) {
   if ($Blob.Length -lt ($script:HeaderLength + 16 + $script:MacLength)) { Stop-Lock $bad }
   if (-not (Test-BytesEqual (Get-Slice $Blob 0 4) $script:FileMagic)) { Stop-Lock 'not a claude-lock file.' }
 
+  # The lower bound stops a planted file from making passphrase guesses cheap.
   $iter = ([int]$Blob[4] -shl 24) -bor ([int]$Blob[5] -shl 16) -bor ([int]$Blob[6] -shl 8) -bor [int]$Blob[7]
-  if ($iter -le 0 -or $iter -gt $script:MaxKdfIterations) { Stop-Lock $bad }
+  if ($iter -lt $script:MinKdfIterations -or $iter -gt $script:MaxKdfIterations) { Stop-Lock $bad }
   $salt = Get-Slice $Blob 8 $script:SaltLength
   $iv = Get-Slice $Blob 24 $script:IvLength
   $keys = Get-LockKeys $Pass $salt $iter
+  try {
+    $bodyLength = $Blob.Length - $script:MacLength
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($keys.Mac)
+    try { $expected = $hmac.ComputeHash((Get-Slice $Blob 0 $bodyLength)) } finally { $hmac.Dispose() }
+    if (-not (Test-BytesEqual $expected (Get-Slice $Blob $bodyLength $script:MacLength))) { Stop-Lock $bad }
 
-  $bodyLength = $Blob.Length - $script:MacLength
-  $hmac = [System.Security.Cryptography.HMACSHA256]::new($keys.Mac)
-  try { $expected = $hmac.ComputeHash((Get-Slice $Blob 0 $bodyLength)) } finally { $hmac.Dispose() }
-  if (-not (Test-BytesEqual $expected (Get-Slice $Blob $bodyLength $script:MacLength))) { Stop-Lock $bad }
-
-  $cipher = Get-Slice $Blob $script:HeaderLength ($bodyLength - $script:HeaderLength)
-  $aes = New-LockAes $keys.Enc $iv
-  try { $plain = $aes.CreateDecryptor().TransformFinalBlock($cipher, 0, $cipher.Length) }
-  catch { Stop-Lock $bad }
-  finally { $aes.Dispose() }
-  [System.Text.Encoding]::UTF8.GetString($plain)
+    $cipher = Get-Slice $Blob $script:HeaderLength ($bodyLength - $script:HeaderLength)
+    $aes = New-LockAes $keys.Enc $iv
+    try { $plain = $aes.CreateDecryptor().TransformFinalBlock($cipher, 0, $cipher.Length) }
+    catch { Stop-Lock $bad }
+    finally { $aes.Dispose() }
+    try { [System.Text.Encoding]::UTF8.GetString($plain) } finally { Clear-Bytes $plain }
+  }
+  finally { Clear-LockKeys $keys }
 }
 
-# Restricts a file or directory to the current user only.
-function Set-OwnerOnlyAcl([string]$Path) {
-  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-  $acl = Get-Acl -LiteralPath $Path
-  $acl.SetAccessRuleProtection($true, $false)
-  foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
+function Get-CurrentUserSid {
+  [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+}
+
+# Full control for the current user, inherited by children of a directory.
+function New-OwnerOnlyRule([bool]$Container) {
   $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
   $allow = [System.Security.AccessControl.AccessControlType]::Allow
-  if (Test-Path -LiteralPath $Path -PathType Container) {
+  if ($Container) {
     $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
     $none = [System.Security.AccessControl.PropagationFlags]::None
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $inherit, $none, $allow)
+    [System.Security.AccessControl.FileSystemAccessRule]::new((Get-CurrentUserSid), $rights, $inherit, $none, $allow)
   }
   else {
-    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $allow)
+    [System.Security.AccessControl.FileSystemAccessRule]::new((Get-CurrentUserSid), $rights, $allow)
   }
-  $acl.AddAccessRule($rule)
-  Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+# Restricts a file or directory to the current user only. Only the access
+# rules are read and written: Set-Acl would also write the audit rules, which
+# needs SeSecurityPrivilege.
+function Set-OwnerOnlyAcl([string]$Path) {
+  $container = Test-Path -LiteralPath $Path -PathType Container
+  $acl = if ($container) { New-Object System.Security.AccessControl.DirectorySecurity }
+  else { New-Object System.Security.AccessControl.FileSecurity }
+  $acl.SetAccessRuleProtection($true, $false)
+  $acl.AddAccessRule((New-OwnerOnlyRule $container))
+  if ($container) { [System.IO.Directory]::SetAccessControl($Path, $acl) }
+  else { [System.IO.File]::SetAccessControl($Path, $acl) }
+}
+
+# True if no one but the current user is granted access to $Path.
+function Test-OwnerOnlyAcl([string]$Path) {
+  $sid = Get-CurrentUserSid
+  $rules = (Get-Acl -LiteralPath $Path).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+  foreach ($rule in $rules) {
+    if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference -ne $sid) { return $false }
+  }
+  $true
 }
 
 function New-PrivateDirectory([string]$Path) {
@@ -171,11 +206,19 @@ function New-PrivateDirectory([string]$Path) {
 }
 
 # Replaces $Path with $Bytes (owner-only) without ever leaving a partial file.
+# The temporary file gets its ACL when it is created, so it is never readable
+# by others, not even briefly. Replacing (instead of overwriting) also drops
+# alternate data streams such as a Zone.Identifier of the old file.
 function Write-Atomic([string]$Path, [byte[]]$Bytes) {
   $tmp = Join-Path (Split-Path -Parent $Path) ('.' + (Split-Path -Leaf $Path) + '.' + [guid]::NewGuid().ToString('N'))
+  $security = New-Object System.Security.AccessControl.FileSecurity
+  $security.SetAccessRuleProtection($true, $false)
+  $security.AddAccessRule((New-OwnerOnlyRule $false))
   try {
-    [System.IO.File]::WriteAllBytes($tmp, $Bytes)
-    Set-OwnerOnlyAcl $tmp
+    $stream = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::CreateNew,
+      [System.Security.AccessControl.FileSystemRights]::Write, [System.IO.FileShare]::None, 4096,
+      [System.IO.FileOptions]::None, $security)
+    try { $stream.Write($Bytes, 0, $Bytes.Length) } finally { $stream.Dispose() }
     Move-Item -LiteralPath $tmp -Destination $Path -Force
   }
   finally {

@@ -43,13 +43,23 @@ need() {
   command -v "$1" >/dev/null || die "$1 is missing (sudo apt install $2)."
 }
 
-confirm() {
-  local answer
-  read -rp "$1 [y/N] " answer
+# ask <question>: succeeds only if the answer is y or Y.
+ask() {
+  local answer=""
+  read -rp "$1 [y/N] " answer || true
   case "$answer" in
-    y | Y) ;;
-    *) die "aborted." ;;
+    y | Y) return 0 ;;
+    *) return 1 ;;
   esac
+}
+
+confirm() {
+  ask "$1" || die "aborted."
+}
+
+# Prints the permission bits of a file in octal (GNU and BSD/macOS stat).
+file_mode() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
 }
 
 setup_gpg_tty() {
@@ -105,10 +115,13 @@ install_bin() {
 
 status() {
   if [ -f "$KEYFILE" ]; then
-    echo "Secret:    $KEYFILE (mode $(stat -c %a "$KEYFILE"))"
-    if [ -n "$(find "$KEYFILE" -perm /077)" ]; then
+    local mode
+    mode="$(file_mode "$KEYFILE")"
+    echo "Secret:    $KEYFILE (mode $mode)"
+    if ((8#$mode & 8#077)); then
       echo "           warning: accessible by others (chmod 600 \"$KEYFILE\")"
     fi
+    [ -O "$KEYFILE" ] || echo "           warning: not owned by you"
   else
     echo "Secret:    missing (run: $0 install)"
   fi
@@ -180,11 +193,10 @@ restore_login() {
   unset merged
   echo "Login restored to $CREDENTIALS."
 
-  local answer
-  read -rp "Delete the backup $BACKUP? [y/N] " answer
-  case "$answer" in
-    y | Y) rm -f "$BACKUP" && echo "Backup deleted." ;;
-  esac
+  if ask "Delete the backup $BACKUP?"; then
+    rm -f "$BACKUP"
+    echo "Backup deleted."
+  fi
 }
 
 uninstall() {

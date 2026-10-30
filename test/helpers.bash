@@ -55,6 +55,10 @@ install_secret() {
   printf '%s\n' "$1" | "$SETUP" install >/dev/null
 }
 
+file_mode() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
 decrypt() {
   gpg --quiet --no-symkey-cache --decrypt "$1"
 }

@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+bats_require_minimum_version 1.5.0
+
 load helpers
 
 OAUTH="sk-ant-oat01-test-token"
@@ -26,7 +28,7 @@ write_credentials() {
 @test "install encrypts the secret (mode 600) and installs the launcher" {
   run install_secret "$OAUTH"
   [ "$status" -eq 0 ]
-  [ "$(stat -c %a "$KEYFILE")" = 600 ]
+  [ "$(file_mode "$KEYFILE")" = 600 ]
   [ "$(decrypt "$KEYFILE")" = "$OAUTH" ]
   run ! grep -q "$OAUTH" "$KEYFILE"
   cmp -s "$REPO/claude-secure" "$PREFIX/bin/claude-secure"
@@ -97,9 +99,9 @@ write_credentials() {
   [ "$status" -eq 0 ]
   jq -e 'has("claudeAiOauth") | not' "$CREDENTIALS"
   jq -e '.mcpOAuth.old == 1' "$CREDENTIALS"
-  [ "$(stat -c %a "$CREDENTIALS")" = 600 ]
+  [ "$(file_mode "$CREDENTIALS")" = 600 ]
   [ ! -e "$CREDENTIALS.bak" ]
-  [ "$(stat -c %a "$BACKUP")" = 600 ]
+  [ "$(file_mode "$BACKUP")" = 600 ]
   run ! grep -q secret-access "$BACKUP"
 
   # A token added after locking must survive the restore.
@@ -150,4 +152,12 @@ write_credentials() {
 @test "uninstall rejects unknown options" {
   run "$SETUP" uninstall --force
   [ "$status" -eq 2 ]
+}
+
+@test "uninstall without -y aborts if there is no answer" {
+  install_secret "$OAUTH"
+  run "$SETUP" uninstall </dev/null
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"aborted"* ]]
+  [ -f "$KEYFILE" ]
 }

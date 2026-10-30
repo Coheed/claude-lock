@@ -1,7 +1,8 @@
 # Tests for the Windows variant. No dependencies: runs on the Windows PowerShell
 # 5.1 that ships with Windows. Everything happens in a temporary profile
 # directory, so the real setup is never touched.
-#   powershell -NoProfile -ExecutionPolicy Bypass -File windows\test\Run-Tests.ps1
+#   powershell -NoProfile -File windows\test\Run-Tests.ps1
+# (needs an execution policy that runs local scripts, e.g. RemoteSigned)
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
@@ -14,6 +15,9 @@ function Write-Line([string]$Text) { $script:Out.Add($Text) }
 function Write-ErrLine([string]$Text) { $script:Err.Add($Text) }
 function Read-SecretText([string]$Prompt) { $script:Secrets.Dequeue() }
 function Read-Confirm([string]$Prompt) { $script:Answers.Dequeue() }
+# No real claude: the launcher's start info is recorded instead of started.
+function Find-Claude { [pscustomobject]@{ Source = 'C:\fake\claude.exe' } }
+function Start-ClaudeProcess($StartInfo) { $script:Started = $StartInfo; 7 }
 
 # --- Tiny test framework ---------------------------------------------------
 $script:Total = 0
@@ -41,11 +45,12 @@ function Test-Case([string]$Name, [scriptblock]$Body) {
   $script:Err = New-Object System.Collections.Generic.List[string]
   $script:Secrets = New-Object System.Collections.Generic.Queue[string]
   $script:Answers = New-Object System.Collections.Generic.Queue[bool]
-  $script:Home = Join-Path $dir 'home'
-  $env:CLAUDE_CONFIG_DIR = Join-Path $script:Home '.claude'
-  $env:CLAUDE_LOCK_BIN = Join-Path $script:Home '.local\bin'
+  $script:Started = $null
+  $script:TestHome = Join-Path $dir 'home'
+  $env:CLAUDE_CONFIG_DIR = Join-Path $script:TestHome '.claude'
+  $env:CLAUDE_LOCK_BIN = Join-Path $script:TestHome '.local\bin'
   $env:CLAUDE_SECURE_KEYFILE = Join-Path $env:CLAUDE_CONFIG_DIR 'secure\api-key.enc'
-  New-Item -ItemType Directory -Path $script:Home | Out-Null
+  New-Item -ItemType Directory -Path $script:TestHome | Out-Null
 
   # Hard stop (outside the try) if anything would point at the real profile.
   $paths = Get-LockPaths
@@ -62,29 +67,6 @@ function Get-Bytes([string]$Text) { , [System.Text.Encoding]::UTF8.GetBytes($Tex
 function Queue-Secret([string]$Secret, [string]$Pass) {
   foreach ($s in $Secret, $Pass, $Pass) { $script:Secrets.Enqueue($s) }
 }
-
-# --- Fake claude ------------------------------------------------------------
-$fakeDir = Join-Path $script:Root 'fakebin'
-New-Item -ItemType Directory -Path $fakeDir | Out-Null
-Add-Type -OutputType ConsoleApplication -OutputAssembly (Join-Path $fakeDir 'claude.exe') -TypeDefinition @'
-using System;
-using System.IO;
-public static class FakeClaude {
-  public static int Main(string[] args) {
-    string prefix = Environment.GetEnvironmentVariable("FAKE_CLAUDE_OUT");
-    File.WriteAllText(prefix + ".args", string.Join("\n", args));
-    string env = "";
-    foreach (string name in new[] { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR" }) {
-      string value = Environment.GetEnvironmentVariable(name);
-      if (value != null) env += name + "=" + value + "\n";
-    }
-    File.WriteAllText(prefix + ".env", env);
-    return 7;
-  }
-}
-'@
-$env:PATH = "$fakeDir;$env:PATH"
 
 # --- Crypto -----------------------------------------------------------------
 Test-Case 'crypto: round trip, including non-ASCII' {
@@ -108,13 +90,19 @@ Test-Case 'crypto: wrong passphrase is rejected' {
 }
 Test-Case 'crypto: a flipped bit in the ciphertext is rejected' {
   $blob = Protect-Secret 'x' (Get-Bytes 'pw')
-  $blob[$script:HeaderLength] = $blob[$script:HeaderLength] -bxor 1
+  # Changes one byte of the ciphertext.
+  $blob[$script:HeaderLength] = ($blob[$script:HeaderLength] + 1) % 256
   Assert-Throws { Unprotect-Secret $blob (Get-Bytes 'pw') } 'tampering not detected'
 }
 Test-Case 'crypto: a changed iteration count is rejected' {
   $blob = Protect-Secret 'x' (Get-Bytes 'pw')
-  $blob[7] = $blob[7] -bxor 1
+  $blob[7] = ($blob[7] + 1) % 256
   Assert-Throws { Unprotect-Secret $blob (Get-Bytes 'pw') } 'header tampering not detected'
+}
+Test-Case 'crypto: a file with a too low iteration count is rejected' {
+  $script:KdfIterations = 1000
+  try { $blob = Protect-Secret 'x' (Get-Bytes 'pw') } finally { $script:KdfIterations = 600000 }
+  Assert-Throws { Unprotect-Secret $blob (Get-Bytes 'pw') } 'weak file accepted'
 }
 Test-Case 'crypto: truncated and foreign files are rejected' {
   Assert-Throws { Unprotect-Secret (New-Object byte[] 10) (Get-Bytes 'pw') } 'short file accepted'
@@ -150,15 +138,28 @@ Test-Case 'unknown command and unknown uninstall option exit 2' {
   Assert-Equal (Invoke-Setup @('uninstall', '--force')) 2 'unknown option'
   Assert-Equal (Invoke-Setup @('status', 'extra')) 2 'extra argument'
 }
-Test-Case 'install encrypts the secret and installs launcher and shim' {
+Test-Case 'install encrypts the secret and installs the launcher, without any batch file' {
   Queue-Secret 'sk-ant-api03-abc' 'pw'
   Assert-Equal (Invoke-Setup @('install')) 0 'exit code'
   $paths = Get-LockPaths
   Assert-Equal (Unprotect-Secret ([System.IO.File]::ReadAllBytes($paths.Keyfile)) (Get-Bytes 'pw')) 'sk-ant-api03-abc' 'secret'
-  Assert-True (Test-Path (Join-Path $paths.Bin 'claude-secure.cmd')) 'shim'
-  Assert-True (Test-Path (Join-Path $paths.Bin 'claude-lock\claude-secure.ps1')) 'launcher'
+  Assert-True (Test-Path (Join-Path $paths.Bin 'claude-secure.ps1')) 'launcher'
   Assert-True (Test-Path (Join-Path $paths.Bin 'claude-lock\ClaudeLock.Common.ps1')) 'common'
+  Assert-True (-not (Get-ChildItem -Path $paths.Bin -Recurse -Include *.cmd, *.bat)) 'batch file installed'
   Assert-True ((Out-Text).Contains('Detected: API key')) 'detection message'
+}
+Test-Case 'reinstall removes the old cmd shim and stale Zone.Identifier streams' {
+  $paths = Get-LockPaths
+  New-Item -ItemType Directory -Force -Path (Join-Path $paths.Bin 'claude-lock') | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $paths.Bin 'claude-secure.cmd'), '@echo off')
+  [System.IO.File]::WriteAllText((Join-Path $paths.Bin 'claude-lock\claude-secure.ps1'), '# old')
+  $common = Join-Path $paths.Bin 'claude-lock\ClaudeLock.Common.ps1'
+  [System.IO.File]::WriteAllText($common, '# old')
+  Set-Content -LiteralPath $common -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
+  Assert-Equal (Invoke-Setup @('reinstall')) 0 'exit code'
+  Assert-True (-not (Test-Path (Join-Path $paths.Bin 'claude-secure.cmd'))) 'old shim kept'
+  Assert-True (-not (Test-Path (Join-Path $paths.Bin 'claude-lock\claude-secure.ps1'))) 'old launcher kept'
+  Assert-True (-not (Get-Item -LiteralPath $common -Stream Zone.Identifier -ErrorAction SilentlyContinue)) 'Zone.Identifier kept'
 }
 Test-Case 'install restricts the key file to the current user' {
   Queue-Secret 'sk-ant-api03-abc' 'pw'
@@ -194,7 +195,7 @@ Test-Case 'update replaces the secret' {
 }
 Test-Case 'reinstall installs only the launcher' {
   Assert-Equal (Invoke-Setup @('reinstall')) 0 'exit code'
-  Assert-True (Test-Path (Join-Path (Get-LockPaths).Bin 'claude-secure.cmd')) 'shim'
+  Assert-True (Test-Path (Join-Path (Get-LockPaths).Bin 'claude-secure.ps1')) 'launcher'
   Assert-True (-not (Test-Path (Get-LockPaths).Keyfile)) 'key file created'
 }
 Test-Case 'status reports a missing setup, then a current launcher and a stored login' {
@@ -280,7 +281,7 @@ Test-Case 'uninstall -y removes secret and launcher, keeps the backup' {
   [System.IO.File]::WriteAllText($paths.Backup, 'backup')
   Assert-Equal (Invoke-Setup @('uninstall', '-y')) 0 'exit code'
   Assert-True (-not (Test-Path $paths.Keyfile)) 'key file'
-  Assert-True (-not (Test-Path (Join-Path $paths.Bin 'claude-secure.cmd'))) 'shim'
+  Assert-True (-not (Test-Path (Join-Path $paths.Bin 'claude-secure.ps1'))) 'launcher'
   Assert-True (-not (Test-Path (Join-Path $paths.Bin 'claude-lock'))) 'launcher dir'
   Assert-True (Test-Path $paths.Backup) 'backup removed'
 }
@@ -294,20 +295,24 @@ Test-Case 'uninstall without -y asks first' {
 
 # --- Launcher ---------------------------------------------------------------
 function Start-Launcher([string[]]$ClaudeArgs) {
-  $env:FAKE_CLAUDE_OUT = Join-Path $script:Home 'record'
   $env:ANTHROPIC_API_KEY = 'leftover-key'
-  try { Invoke-ClaudeSecure $ClaudeArgs } finally { Remove-Item Env:\ANTHROPIC_API_KEY, Env:\FAKE_CLAUDE_OUT -ErrorAction SilentlyContinue }
+  try { Invoke-ClaudeSecure $ClaudeArgs } finally { Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue }
 }
 function Install-Secret([string]$Secret) {
   Queue-Secret $Secret 'pw'
   $null = Invoke-Setup @('install')
   $script:Out.Clear()
 }
+# The secret-related variables claude would see, as "NAME=value" lines.
+function Get-ChildSecretEnv {
+  $vars = $script:Started.EnvironmentVariables
+  @(foreach ($name in $script:SecretVariables) { if ($vars.ContainsKey($name)) { "$name=$($vars[$name])" } }) -join "`n"
+}
 
 Test-Case 'launcher: --lock-help exits 0 without starting claude' {
   Assert-Equal (Start-Launcher @('--lock-help')) 0 'exit code'
   Assert-True ((Out-Text).Contains('Usage: claude-secure')) 'usage'
-  Assert-True (-not (Test-Path "$($script:Home)\record.args")) 'claude was started'
+  Assert-True ($null -eq $script:Started) 'claude was started'
 }
 Test-Case 'launcher: fails before the passphrase prompt if the secret is missing' {
   Assert-Equal (Start-Launcher @()) 1 'exit code'
@@ -317,28 +322,29 @@ Test-Case 'launcher: passes an OAuth token to the child only and drops conflicti
   Install-Secret 'sk-ant-oat01-token'
   $script:Secrets.Enqueue('pw')
   Assert-Equal (Start-Launcher @()) 7 'exit code of claude'
-  Assert-Equal ([System.IO.File]::ReadAllText("$($script:Home)\record.env")) "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-token`n" 'child environment'
+  Assert-Equal $script:Started.FileName 'C:\fake\claude.exe' 'program'
+  Assert-True (-not $script:Started.UseShellExecute) 'shell execute'
+  Assert-Equal (Get-ChildSecretEnv) 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-token' 'child environment'
   Assert-True (-not (Test-Path Env:\CLAUDE_CODE_OAUTH_TOKEN)) 'token leaked into this shell'
 }
 Test-Case 'launcher: passes an API key as ANTHROPIC_API_KEY' {
   Install-Secret 'sk-ant-api03-key'
   $script:Secrets.Enqueue('pw')
   $null = Start-Launcher @()
-  Assert-Equal ([System.IO.File]::ReadAllText("$($script:Home)\record.env")) "ANTHROPIC_API_KEY=sk-ant-api03-key`n" 'child environment'
+  Assert-Equal (Get-ChildSecretEnv) 'ANTHROPIC_API_KEY=sk-ant-api03-key' 'child environment'
 }
 Test-Case 'launcher: passes all arguments unchanged' {
   Install-Secret 'sk-ant-api03-key'
   $script:Secrets.Enqueue('pw')
-  $given = '-p', 'two words', 'say "hi"', 'C:\dir with space\', '', '--model=x'
-  $null = Start-Launcher $given
-  Assert-Equal ([System.IO.File]::ReadAllText("$($script:Home)\record.args")) ($given -join "`n") 'arguments'
+  $null = Start-Launcher @('-p', 'two words', 'say "hi"', 'C:\dir with space\', '', '--model=x')
+  Assert-Equal $script:Started.Arguments '-p "two words" "say \"hi\"" "C:\dir with space\\" "" --model=x' 'command line'
 }
 Test-Case 'launcher: a wrong passphrase does not start claude' {
   Install-Secret 'sk-ant-api03-key'
   $script:Secrets.Enqueue('wrong')
   Assert-Equal (Start-Launcher @()) 1 'exit code'
   Assert-True ((Err-Text).Contains('decryption failed')) 'message'
-  Assert-True (-not (Test-Path "$($script:Home)\record.args")) 'claude was started'
+  Assert-True ($null -eq $script:Started) 'claude was started'
 }
 Test-Case 'launcher: warns about a stored login' {
   Install-Secret 'sk-ant-api03-key'
@@ -347,10 +353,30 @@ Test-Case 'launcher: warns about a stored login' {
   $null = Start-Launcher @()
   Assert-True ((Err-Text).Contains('stored login')) 'warning'
 }
-Test-Case 'installed shim starts the launcher end to end' {
+Test-Case 'launcher: warns if the key file is accessible by other accounts' {
   Install-Secret 'sk-ant-api03-key'
-  $shim = Join-Path (Get-LockPaths).Bin 'claude-secure.cmd'
-  $text = & cmd.exe /c "`"$shim`" --lock-help" 2>&1
+  $keyfile = (Get-LockPaths).Keyfile
+  $acl = [System.IO.File]::GetAccessControl($keyfile, 'Access')
+  $everyone = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+  $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($everyone, 'Read', 'Allow'))
+  [System.IO.File]::SetAccessControl($keyfile, $acl)
+  $script:Secrets.Enqueue('pw')
+  $null = Start-Launcher @()
+  Assert-True ((Err-Text).Contains('accessible by other accounts')) 'warning'
+}
+Test-Case 'launcher: refuses cmd.exe metacharacters only for a batch-file claude' {
+  Assert-True (Test-BatchFile 'C:\npm\claude.cmd') '.cmd'
+  Assert-True (Test-BatchFile 'C:\npm\CLAUDE.BAT') '.bat'
+  Assert-True (-not (Test-BatchFile 'C:\bin\claude.exe')) '.exe'
+  Assert-BatchSafeArgs @('-p', 'two words', '--model=x', 'C:\dir\')
+  foreach ($bad in 'a&b', '%PATH%', 'x|y', 'say "hi"', 'a^b', "line`nbreak", 'wow!') {
+    Assert-Throws { Assert-BatchSafeArgs @($bad) } "accepted $bad"
+  }
+}
+Test-Case 'installed launcher runs from the bin directory end to end' {
+  Install-Secret 'sk-ant-api03-key'
+  $launcher = Join-Path (Get-LockPaths).Bin 'claude-secure.ps1'
+  $text = & $launcher --lock-help 6>&1
   Assert-Equal $LASTEXITCODE 0 'exit code'
   Assert-True (($text -join "`n").Contains('Usage: claude-secure')) 'usage'
 }

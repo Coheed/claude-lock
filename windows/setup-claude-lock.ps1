@@ -5,10 +5,14 @@ $ErrorActionPreference = 'Stop'
 $script:SourceDir = $PSScriptRoot
 . (Join-Path $script:SourceDir 'ClaudeLock.Common.ps1')
 
-$script:ShimText = "@echo off`r`n" +
-  "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0claude-lock\claude-secure.ps1`" %*`r`n" +
-  "exit /b %ERRORLEVEL%`r`n"
-$script:LauncherFiles = 'claude-secure.ps1', 'ClaudeLock.Common.ps1'
+# Source file -> installed path relative to the bin directory. claude-secure.ps1
+# sits directly in bin, so PowerShell finds it as `claude-secure` via PATH.
+$script:LauncherFiles = [ordered]@{
+  'claude-secure.ps1'     = 'claude-secure.ps1'
+  'ClaudeLock.Common.ps1' = 'claude-lock\ClaudeLock.Common.ps1'
+}
+# Left behind by older versions (a cmd shim calling the launcher in claude-lock\).
+$script:LegacyFiles = 'claude-secure.cmd', 'claude-lock\claude-secure.ps1'
 
 function Get-SetupUsage {
   @"
@@ -50,46 +54,74 @@ function Save-Secret {
   else { Write-ErrLine 'Warning: secret does not start with sk-ant-.' }
 
   $pass = Read-NewPassphrase 'Passphrase: '
-  New-PrivateDirectory $paths.SecDir
-  Write-Atomic $paths.Keyfile (Protect-Secret $key $pass)
+  try {
+    New-PrivateDirectory $paths.SecDir
+    Write-Atomic $paths.Keyfile (Protect-Secret $key $pass)
+  }
+  finally { Clear-Bytes $pass }
+}
+
+# Restricted (the default on Windows clients) and AllSigned block the
+# unsigned launcher; RemoteSigned runs it because it was written locally.
+function Test-ScriptsAllowed {
+  (Get-ExecutionPolicy) -notin 'Restricted', 'AllSigned', 'Undefined'
+}
+
+function Get-ExecutionPolicyHint {
+  "PowerShell does not run local scripts yet (execution policy $(Get-ExecutionPolicy)). Run once: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
+}
+
+function Remove-LegacyLauncher([string]$Bin) {
+  foreach ($file in $script:LegacyFiles) {
+    Remove-Item -LiteralPath (Join-Path $Bin $file) -Force -ErrorAction SilentlyContinue
+  }
 }
 
 function Install-Bin {
   $paths = Get-LockPaths
-  $dir = Join-Path $paths.Bin 'claude-lock'
-  New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  foreach ($file in $script:LauncherFiles) {
-    Copy-Item -LiteralPath (Join-Path $script:SourceDir $file) -Destination $dir -Force
+  New-Item -ItemType Directory -Force -Path (Join-Path $paths.Bin 'claude-lock') | Out-Null
+  # Written fresh instead of copied: a copy would keep the Zone.Identifier of a
+  # downloaded archive, and RemoteSigned would then refuse to run it.
+  foreach ($entry in $script:LauncherFiles.GetEnumerator()) {
+    Write-Atomic (Join-Path $paths.Bin $entry.Value) ([System.IO.File]::ReadAllBytes((Join-Path $script:SourceDir $entry.Key)))
   }
-  [System.IO.File]::WriteAllText((Join-Path $paths.Bin 'claude-secure.cmd'), $script:ShimText, [System.Text.Encoding]::ASCII)
-  Write-Line 'Done. Start with: claude-secure'
+  Remove-LegacyLauncher $paths.Bin
+  Write-Line 'Done. Start with: claude-secure (in PowerShell)'
   if (-not (Test-InPath $paths.Bin)) {
     Write-Line "Note: $($paths.Bin) is not in your PATH."
   }
+  if (-not (Test-ScriptsAllowed)) { Write-Line "Note: $(Get-ExecutionPolicyHint)" }
 }
 
 function Test-LauncherCurrent {
   $paths = Get-LockPaths
-  $dir = Join-Path $paths.Bin 'claude-lock'
-  foreach ($file in $script:LauncherFiles) {
-    $installed = Join-Path $dir $file
+  foreach ($entry in $script:LauncherFiles.GetEnumerator()) {
+    $installed = Join-Path $paths.Bin $entry.Value
     if (-not (Test-Path -LiteralPath $installed)) { return $false }
-    if ((Get-FileHash -LiteralPath $installed).Hash -ne (Get-FileHash -LiteralPath (Join-Path $script:SourceDir $file)).Hash) { return $false }
+    if ((Get-FileHash -LiteralPath $installed).Hash -ne (Get-FileHash -LiteralPath (Join-Path $script:SourceDir $entry.Key)).Hash) { return $false }
   }
-  $shim = Join-Path $paths.Bin 'claude-secure.cmd'
-  (Test-Path -LiteralPath $shim) -and ([System.IO.File]::ReadAllText($shim) -ceq $script:ShimText)
+  $true
 }
 
 function Show-Status {
   $paths = Get-LockPaths
-  if (Test-Path -LiteralPath $paths.Keyfile) { Write-Line "Secret:    $($paths.Keyfile)" }
+  if (Test-Path -LiteralPath $paths.Keyfile) {
+    Write-Line "Secret:    $($paths.Keyfile)"
+    if (-not (Test-OwnerOnlyAcl $paths.Keyfile)) {
+      Write-Line '           warning: accessible by other accounts (run: .\setup-claude-lock.ps1 update)'
+    }
+  }
   else { Write-Line 'Secret:    missing (run: .\setup-claude-lock.ps1 install)' }
 
-  $shim = Join-Path $paths.Bin 'claude-secure.cmd'
-  if (-not (Test-Path -LiteralPath $shim)) { Write-Line 'Launcher:  not installed (run: .\setup-claude-lock.ps1 reinstall)' }
-  elseif (Test-LauncherCurrent) { Write-Line "Launcher:  $shim (up to date)" }
-  else { Write-Line "Launcher:  $shim (differs from this checkout; run: .\setup-claude-lock.ps1 reinstall)" }
+  $launcher = Join-Path $paths.Bin 'claude-secure.ps1'
+  if (-not (Test-Path -LiteralPath $launcher)) { Write-Line 'Launcher:  not installed (run: .\setup-claude-lock.ps1 reinstall)' }
+  elseif (Test-LauncherCurrent) { Write-Line "Launcher:  $launcher (up to date)" }
+  else { Write-Line "Launcher:  $launcher (differs from this checkout; run: .\setup-claude-lock.ps1 reinstall)" }
   if (-not (Test-InPath $paths.Bin)) { Write-Line "           note: $($paths.Bin) is not in your PATH" }
+  if (-not (Test-ScriptsAllowed)) { Write-Line "           note: $(Get-ExecutionPolicyHint)" }
+  if (Test-Path -LiteralPath (Join-Path $paths.Bin 'claude-secure.cmd')) {
+    Write-Line '           note: an old claude-secure.cmd is still installed (run: .\setup-claude-lock.ps1 reinstall)'
+  }
 
   if (Test-HasLogin $paths.Credentials) {
     Write-Line "Login:     stored in $($paths.Credentials); plain claude starts without passphrase (run: .\setup-claude-lock.ps1 lock-login)"
@@ -118,7 +150,8 @@ function Lock-Login {
   Write-Line 'Choose a passphrase for the backup.'
   $pass = Read-NewPassphrase 'Passphrase: '
   $text = [System.IO.File]::ReadAllText($paths.Credentials, [System.Text.Encoding]::UTF8)
-  Write-Atomic $paths.Backup (Protect-Secret $text $pass)
+  try { Write-Atomic $paths.Backup (Protect-Secret $text $pass) }
+  finally { Clear-Bytes $pass }
 
   $json = ConvertFrom-Json -InputObject $text
   $json.PSObject.Properties.Remove('claudeAiOauth')
@@ -133,6 +166,7 @@ function Restore-Login {
   $pass = Read-LockPassphrase 'Backup passphrase: '
   try { $backup = ConvertFrom-Json -InputObject (Unprotect-Secret ([System.IO.File]::ReadAllBytes($paths.Backup)) $pass) }
   catch { Stop-Lock 'restoring failed (wrong passphrase?).' }
+  finally { Clear-Bytes $pass }
   if (-not $backup.PSObject.Properties['claudeAiOauth']) { Stop-Lock 'restoring failed: backup contains no claudeAiOauth.' }
 
   # Keep everything in the current file (e.g. newer MCP tokens), add the login.
@@ -153,7 +187,8 @@ function Uninstall-Lock([bool]$Yes) {
   $paths = Get-LockPaths
   if (-not $Yes) { Assert-Confirmed 'Remove the encrypted secret and claude-secure?' }
   Remove-Item -LiteralPath $paths.Keyfile -Force -ErrorAction SilentlyContinue
-  Remove-Item -LiteralPath (Join-Path $paths.Bin 'claude-secure.cmd') -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath (Join-Path $paths.Bin 'claude-secure.ps1') -Force -ErrorAction SilentlyContinue
+  Remove-LegacyLauncher $paths.Bin
   Remove-Item -LiteralPath (Join-Path $paths.Bin 'claude-lock') -Recurse -Force -ErrorAction SilentlyContinue
   if ((Test-Path -LiteralPath $paths.SecDir) -and -not (Get-ChildItem -LiteralPath $paths.SecDir -Force)) {
     Remove-Item -LiteralPath $paths.SecDir -Force

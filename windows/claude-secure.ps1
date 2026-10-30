@@ -6,7 +6,10 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-. (Join-Path $PSScriptRoot 'ClaudeLock.Common.ps1')
+# Installed: next to it in claude-lock\. In the checkout: right beside it.
+$common = Join-Path $PSScriptRoot 'claude-lock\ClaudeLock.Common.ps1'
+if (-not (Test-Path -LiteralPath $common)) { $common = Join-Path $PSScriptRoot 'ClaudeLock.Common.ps1' }
+. $common
 
 # Quotes one argument following the CommandLineToArgvW rules, so arguments with
 # spaces and quotes reach `claude` unchanged (Windows PowerShell 5.1 gets this wrong).
@@ -32,6 +35,43 @@ function ConvertTo-WindowsArg([string]$Argument) {
   $sb.ToString()
 }
 
+$script:SecretVariables = 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'
+
+# Returns the exit code. A function of its own so the tests can replace it.
+function Start-ClaudeProcess([System.Diagnostics.ProcessStartInfo]$StartInfo) {
+  $process = [System.Diagnostics.Process]::Start($StartInfo)
+  try {
+    $process.WaitForExit()
+    $process.ExitCode
+  }
+  finally { $process.Dispose() }
+}
+
+# Prefers claude.exe. The npm package installs claude.cmd, which runs through
+# cmd.exe; see Assert-BatchSafeArgs.
+function Find-Claude {
+  $found = @(Get-Command claude -CommandType Application -All -ErrorAction SilentlyContinue)
+  $exe = @($found | Where-Object { $_.Extension -ieq '.exe' })
+  if ($exe) { return $exe[0] }
+  if ($found) { return $found[0] }
+  $null
+}
+
+function Test-BatchFile([string]$Path) {
+  [System.IO.Path]::GetExtension($Path) -in '.cmd', '.bat'
+}
+
+# cmd.exe interprets these characters even inside quotes, so an argument that
+# contains them could run other commands.
+function Assert-BatchSafeArgs([string[]]$ClaudeArgs) {
+  foreach ($argument in $ClaudeArgs) {
+    if ($argument -match '[%!^&|<>"\r\n]') {
+      Stop-Lock "claude is a batch file; refusing the argument '$argument' (cmd.exe would interpret % ! ^ & | < > `" or line breaks). Install the native claude.exe to pass such arguments."
+    }
+  }
+}
+
 function Show-SecureUsage {
   Write-Line @"
 Usage: claude-secure [claude arguments...]
@@ -39,7 +79,8 @@ Usage: claude-secure [claude arguments...]
 Decrypts the stored secret (passphrase) and then starts `claude`.
 The secret is either an API key or a subscription OAuth token
 (created with `claude setup-token`); the type is detected automatically.
-All arguments are passed to `claude` unchanged.
+All arguments are passed to `claude` unchanged. PowerShell may treat a
+lone -- as its own end-of-parameters marker; quote it ('--') to pass it on.
 
 Environment:
   CLAUDE_SECURE_KEYFILE  Path to the encrypted secret
@@ -56,10 +97,14 @@ function Invoke-ClaudeSecure([string[]]$ClaudeArgs) {
 
     # Check everything before asking for the passphrase.
     $paths = Get-LockPaths
-    $claude = Get-Command claude -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    $claude = Find-Claude
     if (-not $claude) { Stop-Lock 'claude not found in PATH.' }
+    if (Test-BatchFile $claude.Source) { Assert-BatchSafeArgs $ClaudeArgs }
     if (-not (Test-Path -LiteralPath $paths.Keyfile -PathType Leaf)) {
       Stop-Lock "encrypted secret not found: $($paths.Keyfile) (run setup-claude-lock.ps1 install first)."
+    }
+    if (-not (Test-OwnerOnlyAcl $paths.Keyfile)) {
+      Write-ErrLine "claude-secure: warning: $($paths.Keyfile) is accessible by other accounts (run setup-claude-lock.ps1 update)."
     }
     if (Test-HasLogin $paths.Credentials) {
       Write-ErrLine "claude-secure: warning: a stored login exists in $($paths.Credentials);"
@@ -69,6 +114,7 @@ function Invoke-ClaudeSecure([string[]]$ClaudeArgs) {
     $pass = Read-LockPassphrase 'Passphrase: '
     try { $secret = Unprotect-Secret ([System.IO.File]::ReadAllBytes($paths.Keyfile)) $pass }
     catch { Stop-Lock 'decryption failed (wrong passphrase?).' }
+    finally { Clear-Bytes $pass }
     if (-not $secret) { Stop-Lock 'decrypted secret is empty.' }
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -77,16 +123,11 @@ function Invoke-ClaudeSecure([string[]]$ClaudeArgs) {
     $psi.Arguments = (@($ClaudeArgs | ForEach-Object { ConvertTo-WindowsArg $_ })) -join ' '
 
     # Remove anything that would take precedence over (or conflict with) the secret.
-    foreach ($name in 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
-      'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR') {
-      $psi.EnvironmentVariables.Remove($name)
-    }
+    foreach ($name in $script:SecretVariables) { $psi.EnvironmentVariables.Remove($name) }
     $variable = if ($secret.StartsWith('sk-ant-oat')) { 'CLAUDE_CODE_OAUTH_TOKEN' } else { 'ANTHROPIC_API_KEY' }
     $psi.EnvironmentVariables[$variable] = $secret
 
-    $process = [System.Diagnostics.Process]::Start($psi)
-    $process.WaitForExit()
-    return $process.ExitCode
+    return (Start-ClaudeProcess $psi)
   }
   catch {
     Write-ErrLine "claude-secure: $($_.Exception.Message)"
