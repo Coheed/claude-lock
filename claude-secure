@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# claude-secure: starts Claude Code only after the GPG passphrase was entered.
+# The API key is stored encrypted on disk only and is exposed as
+# ANTHROPIC_API_KEY to the `claude` process alone.
+set -euo pipefail
+
+KEYFILE="${CLAUDE_SECURE_KEYFILE:-$HOME/.claude/secure/api-key.gpg}"
+
+die() {
+  echo "claude-secure: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: claude-secure [claude arguments...]
+
+Decrypts the API key (GPG passphrase) and then starts \`claude\`.
+All arguments are passed to \`claude\` unchanged.
+
+Environment:
+  CLAUDE_SECURE_KEYFILE  Path to the encrypted key (default: $KEYFILE)
+EOF
+}
+
+main() {
+  # Dedicated flag so that `claude --help` is still passed through.
+  if [ "${1:-}" = "--lock-help" ]; then
+    usage
+    exit 0
+  fi
+
+  # Check everything before asking for the passphrase.
+  command -v gpg >/dev/null || die "gpg is missing (sudo apt install gnupg)."
+  command -v claude >/dev/null || die "claude not found in PATH."
+  [ -f "$KEYFILE" ] || die "encrypted key not found: $KEYFILE (run setup-claude-lock.sh install first)."
+
+  local mode
+  mode="$(stat -c %a "$KEYFILE")"
+  if [ "${mode: -2}" != "00" ]; then
+    echo "claude-secure: warning: $KEYFILE is accessible by others (mode $mode)." >&2
+  fi
+
+  GPG_TTY="$(tty 2>/dev/null)" || die "no terminal available for the passphrase prompt."
+  export GPG_TTY
+
+  # --no-symkey-cache: ask for the passphrase on every start.
+  local key
+  key="$(gpg --quiet --no-symkey-cache --decrypt "$KEYFILE")" ||
+    die "decryption failed (wrong passphrase?)."
+  [ -n "$key" ] || die "decrypted key is empty."
+
+  export ANTHROPIC_API_KEY="$key"
+  unset key
+  exec claude "$@"
+}
+
+main "$@"
